@@ -156,8 +156,13 @@ pub fn cleanup_engine() {
 
 /// Get completion candidates for a given prefix from the global JS engine.
 ///
-/// Evaluates `Object.keys(globalThis)` (and prototype chain via a helper) in the
-/// running engine and returns all property names that start with `prefix`.
+/// Supports dot notation: if `prefix` contains a `.` (e.g. `"console.l"` or
+/// `"Memory."`), the part before the last dot is evaluated as a JS expression
+/// and properties of that object (including prototype chain) are enumerated.
+/// Otherwise, properties of `globalThis` are enumerated.
+///
+/// Returns property names (never the full dotted path) so that the caller can
+/// use the result as rustyline replacement candidates starting from after the dot.
 /// Returns an empty vec if the engine is not initialised or on any error.
 pub fn complete_script(prefix: &str) -> Vec<String> {
     let engine = match JS_ENGINE.lock() {
@@ -169,8 +174,51 @@ pub fn complete_script(prefix: &str) -> Vec<String> {
         None => return vec![],
     };
 
-    let script = r#"
-        (function() {
+    // Split on the last '.' to support multi-level paths like "a.b.c"
+    let (script, prop_prefix) = if let Some(dot_pos) = prefix.rfind('.') {
+        let obj_path = &prefix[..dot_pos];
+        let prop_part = &prefix[dot_pos + 1..];
+
+        // Escape the object path for safe embedding inside a JS string literal
+        let escaped = obj_path
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
+
+        let js = format!(
+            r#"(function() {{
+                var names = [];
+                var obj;
+                try {{
+                    obj = eval("({escaped})");
+                }} catch(e) {{
+                    return JSON.stringify([]);
+                }}
+                if (obj === null || obj === undefined) {{
+                    return JSON.stringify([]);
+                }}
+                var seen = {{}};
+                var cur = obj;
+                while (cur !== null && cur !== undefined) {{
+                    try {{
+                        var keys = Object.getOwnPropertyNames(cur);
+                        for (var i = 0; i < keys.length; i++) {{
+                            if (!seen[keys[i]]) {{
+                                seen[keys[i]] = true;
+                                names.push(keys[i]);
+                            }}
+                        }}
+                    }} catch(e) {{}}
+                    cur = Object.getPrototypeOf(cur);
+                }}
+                return JSON.stringify(names);
+            }})()"#
+        );
+        (js, prop_part.to_string())
+    } else {
+        // No dot: enumerate globalThis
+        let js = r#"(function() {
             var names = [];
             var obj = globalThis;
             while (obj !== null && obj !== undefined) {
@@ -181,10 +229,12 @@ pub fn complete_script(prefix: &str) -> Vec<String> {
                 obj = Object.getPrototypeOf(obj);
             }
             return JSON.stringify(names);
-        })()
-    "#;
+        })()"#
+        .to_string();
+        (js, prefix.to_string())
+    };
 
-    let result = match engine.eval(script) {
+    let result = match engine.eval(&script) {
         Ok(v) => v,
         Err(_) => return vec![],
     };
@@ -204,14 +254,14 @@ pub fn complete_script(prefix: &str) -> Vec<String> {
         return vec![];
     }
 
-    let prefix_lower = prefix.to_lowercase();
+    let prop_lower = prop_prefix.to_lowercase();
     let mut candidates: Vec<String> = trimmed
         .split(',')
         .filter_map(|s| {
             let s = s.trim().trim_matches('"');
             if s.is_empty() { None } else { Some(s.to_string()) }
         })
-        .filter(|name| name.to_lowercase().starts_with(&prefix_lower))
+        .filter(|name| name.to_lowercase().starts_with(&prop_lower))
         .collect();
 
     // Deduplicate while preserving order

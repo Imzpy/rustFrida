@@ -30,7 +30,7 @@ use std::os::unix::io::FromRawFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
@@ -38,6 +38,7 @@ use std::thread::JoinHandle;
 use std::process;
 
 static AGENT_MEMFD: AtomicI32 = AtomicI32::new(-1);
+static STOP_LISTENER: AtomicBool = AtomicBool::new(false);
 
 /// Shared state for synchronous jscomplete request/response.
 /// The Condvar is notified when the agent returns a COMPLETE: response.
@@ -528,10 +529,17 @@ fn handle_socket_connection(mut stream: UnixStream) {
                 }
             } else if trimmed == "HELLO_AGENT" {
                 log_success!("Agent 已连接");
+                STOP_LISTENER.store(true, Ordering::SeqCst);
                 let mut stream_clone = stream.try_clone().unwrap();
                 thread::spawn(move || {
                     let (sd,rx) = channel();
-                    GLOBAL_SENDER.set(sd).unwrap();
+                    match GLOBAL_SENDER.set(sd) {
+                        Ok(_) => {},
+                        Err(_) => {
+                            log_error!("GLOBAL_SENDER already set!");
+                            return;
+                        }
+                    }
                     unsafe {*(AGENT_STAT.write().unwrap()) = true;}
                     while let Ok(msg) = rx.recv() {
                         match stream_clone.write_all(msg.as_bytes()){
@@ -601,15 +609,22 @@ fn start_socket_listener(socket_path: &str) -> Result<JoinHandle<()>, Box<dyn st
         return Err(Box::new(std::io::Error::last_os_error()));
     }
 
-    // 转为 Rust 的 UnixListener
+    // 转为 Rust 的 UnixListener，设为非阻塞以便响应停止信号
     let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+    listener.set_nonblocking(true).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     let handle = thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
+        loop {
+            if STOP_LISTENER.load(Ordering::SeqCst) {
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
                     thread::spawn(move || {
                         handle_socket_connection(stream);
                     });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(e) => log_error!("接受连接失败: {}", e),
             }
@@ -1007,17 +1022,19 @@ impl Completer for JsReplCompleter {
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let before_cursor = &line[..pos];
 
-        // Determine what to complete: after the last '.' we complete a property,
-        // otherwise we complete from the global scope.
-        let (start, prefix) = if let Some(dot_pos) = before_cursor.rfind('.') {
-            // object.prop<TAB>  →  complete prop on that object (still query global for now)
-            (dot_pos + 1, &before_cursor[dot_pos + 1..])
+        // Determine the replacement start position.  After the last '.' we only
+        // replace the property fragment, but we send the *full* before_cursor
+        // (e.g. "console.l") so the agent can resolve the object and enumerate
+        // its properties.
+        let (start, query) = if let Some(dot_pos) = before_cursor.rfind('.') {
+            // start is right after the dot so rustyline replaces only the property part
+            (dot_pos + 1, before_cursor)
         } else {
             (0, before_cursor)
         };
 
         let candidates: Vec<Pair> = self
-            .fetch_completions(prefix)
+            .fetch_completions(query)
             .into_iter()
             .map(|name| Pair {
                 display: name.clone(),
