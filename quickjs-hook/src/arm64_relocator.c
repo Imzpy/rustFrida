@@ -41,6 +41,9 @@ void arm64_relocator_init(Arm64Relocator* r, const void* input, uint64_t input_p
     memset(&r->current_info, 0, sizeof(r->current_info));
     r->eoi = 0;
     r->eob = 0;
+    r->region_label_count = 0;
+    r->region_end = 0;
+    memset(r->region_labels, 0, sizeof(r->region_labels));
 }
 
 void arm64_relocator_reset(Arm64Relocator* r, const void* input, uint64_t input_pc) {
@@ -51,6 +54,9 @@ void arm64_relocator_reset(Arm64Relocator* r, const void* input, uint64_t input_
     memset(&r->current_info, 0, sizeof(r->current_info));
     r->eoi = 0;
     r->eob = 0;
+    r->region_label_count = 0;
+    r->region_end = 0;
+    memset(r->region_labels, 0, sizeof(r->region_labels));
 }
 
 void arm64_relocator_clear(Arm64Relocator* r) {
@@ -508,6 +514,17 @@ Arm64RelocResult arm64_relocator_relocate_insn(uint64_t src_pc, uint64_t dst_pc,
  * Writing Instructions
  * ============================================================================ */
 
+/* Look up the writer label for a source address within the hook region.
+ * Returns the label_id if found, 0 if not found (0 is never a valid label ID
+ * because arm64_writer_init sets next_label_id = 1). */
+static uint64_t find_region_label(const Arm64Relocator* r, uint64_t src_target) {
+    for (int i = 0; i < r->region_label_count; i++) {
+        if (r->region_labels[i].src_pc == src_target)
+            return r->region_labels[i].label_id;
+    }
+    return 0;
+}
+
 Arm64RelocResult arm64_relocator_write_one(Arm64Relocator* r) {
     uint64_t src_pc = r->input_pc + (uint64_t)(r->input_cur - r->input_start - 4);
     uint64_t dst_pc = arm64_writer_pc(r->output);
@@ -516,6 +533,58 @@ Arm64RelocResult arm64_relocator_write_one(Arm64Relocator* r) {
         /* Non-PC-relative instruction, just copy it */
         arm64_writer_put_insn(r->output, r->current_insn);
         return ARM64_RELOC_OK;
+    }
+
+    /* --- Within-region branch fixup (MUST be checked before direct relocation) ---
+     *
+     * If the branch target falls inside [input_pc, region_end) it is within
+     * the bytes that we are relocating into the trampoline.  The caller has
+     * pre-created a writer label for every source instruction in this range and
+     * placed each label just before writing that instruction.  We must use those
+     * labels instead of the original source addresses because:
+     *   1. Direct relocation would still point to the original address, which is
+     *      now overwritten by the hook jump sequence → wrong bytes, likely SIGSEGV.
+     *   2. The absolute-branch fallback also uses the original address → same problem.
+     *
+     * Branch-type instructions that are within-region are emitted directly using
+     * a label reference (the offset within the trampoline is always tiny, so the
+     * narrow-range CBZ/TBZ/B.cond forms are always sufficient). */
+    if (r->region_end != 0) {
+        uint64_t target = r->current_info.target;
+        if (target >= r->input_pc && target < r->region_end) {
+            uint64_t lbl = find_region_label(r, target);
+            if (lbl != 0) {
+                switch (r->current_info.type) {
+                    case ARM64_INSN_B:
+                        arm64_writer_put_b_label(r->output, lbl);
+                        return ARM64_RELOC_OK;
+                    case ARM64_INSN_BL:
+                        arm64_writer_put_bl_label(r->output, lbl);
+                        return ARM64_RELOC_OK;
+                    case ARM64_INSN_B_COND:
+                        arm64_writer_put_b_cond_label(r->output, r->current_info.cond, lbl);
+                        return ARM64_RELOC_OK;
+                    case ARM64_INSN_CBZ:
+                        arm64_writer_put_cbz_reg_label(r->output, r->current_info.reg, lbl);
+                        return ARM64_RELOC_OK;
+                    case ARM64_INSN_CBNZ:
+                        arm64_writer_put_cbnz_reg_label(r->output, r->current_info.reg, lbl);
+                        return ARM64_RELOC_OK;
+                    case ARM64_INSN_TBZ:
+                        arm64_writer_put_tbz_reg_imm_label(r->output, r->current_info.reg,
+                                                            r->current_info.bit, lbl);
+                        return ARM64_RELOC_OK;
+                    case ARM64_INSN_TBNZ:
+                        arm64_writer_put_tbnz_reg_imm_label(r->output, r->current_info.reg,
+                                                             r->current_info.bit, lbl);
+                        return ARM64_RELOC_OK;
+                    default:
+                        /* ADR/ADRP/LDR-literal to within-region: unusual; fall through to
+                         * normal relocation (best-effort; data may be overwritten). */
+                        break;
+                }
+            }
+        }
     }
 
     /* Try direct relocation first */
@@ -532,7 +601,7 @@ Arm64RelocResult arm64_relocator_write_one(Arm64Relocator* r) {
     switch (r->current_info.type) {
         case ARM64_INSN_B:
         case ARM64_INSN_BL: {
-            /* Generate: LDR X16, [PC, #8]; BR/BLR X16; .quad target */
+            /* Generate: MOVZ/MOVK sequence into X16; BR/BLR X16 */
             if (r->current_info.type == ARM64_INSN_BL) {
                 arm64_writer_put_call_address(r->output, r->current_info.target);
             } else {
@@ -542,7 +611,7 @@ Arm64RelocResult arm64_relocator_write_one(Arm64Relocator* r) {
         }
 
         case ARM64_INSN_B_COND: {
-            /* Generate: B.!cond skip; LDR X16, [PC, #8]; BR X16; .quad target; skip: */
+            /* Generate: B.!cond skip; MOVZ/MOVK/BR X16; skip: */
             uint64_t skip_label = arm64_writer_new_label_id(r->output);
             Arm64Cond inv_cond = (Arm64Cond)(r->current_info.cond ^ 1); /* Invert condition */
             arm64_writer_put_b_cond_label(r->output, inv_cond, skip_label);
@@ -553,11 +622,10 @@ Arm64RelocResult arm64_relocator_write_one(Arm64Relocator* r) {
 
         case ARM64_INSN_CBZ:
         case ARM64_INSN_CBNZ: {
-            /* Generate: CB(N)Z reg, skip_near; B far_target; skip_near: */
-            /* Or if even that's not enough: CBZ reg, +8; B skip; LDR X16; BR X16; skip: */
+            /* Generate: C(N)BZ reg, skip; MOVZ/MOVK/BR X16 (far target); skip: */
             uint64_t skip_label = arm64_writer_new_label_id(r->output);
 
-            /* Invert the condition */
+            /* Invert the condition to fall through to the far-branch sequence */
             if (r->current_info.type == ARM64_INSN_CBZ) {
                 arm64_writer_put_cbnz_reg_label(r->output, r->current_info.reg, skip_label);
             } else {

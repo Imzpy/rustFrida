@@ -78,6 +78,15 @@ typedef struct {
     int fp_size;                /* Size for FP literal: 4, 8, or 16 bytes */
 } Arm64InsnInfo;
 
+/* Region label entry: maps one source instruction address to a writer label.
+ * Used to fix up within-region branches so they target the relocated copy in
+ * the trampoline rather than the original (now-overwritten) address. */
+#define ARM64_RELOC_MAX_REGION 8
+typedef struct {
+    uint64_t src_pc;    /* original source address of the instruction */
+    uint64_t label_id;  /* writer label ID placed at its destination */
+} Arm64RegionLabel;
+
 /* ARM64 Relocator state */
 typedef struct {
     const uint8_t* input_start;  /* Start of input buffer */
@@ -92,6 +101,14 @@ typedef struct {
 
     int eoi;                     /* End-of-input flag */
     int eob;                     /* End-of-block flag (unconditional branch encountered) */
+
+    /* Within-region branch fixup: maps each source instruction to a writer
+     * label placed at its relocated destination.  Populated by the caller
+     * (hook_relocate_instructions) before the write loop so that forward
+     * references can be resolved even before the target instruction is written. */
+    Arm64RegionLabel region_labels[ARM64_RELOC_MAX_REGION];
+    int region_label_count;  /* number of valid entries */
+    uint64_t region_end;     /* one-past-last byte of the hook region (src) */
 } Arm64Relocator;
 
 /* ============================================================================

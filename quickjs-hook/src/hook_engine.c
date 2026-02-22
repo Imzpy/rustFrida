@@ -199,7 +199,14 @@ void* hook_alloc(size_t size) {
     return ptr;
 }
 
-/* Relocate instructions from src to dst using arm64_relocator */
+/* Relocate instructions from src to dst using arm64_relocator.
+ *
+ * Within-region branch fix: before the write loop we pre-create one writer
+ * label per source instruction and record them in the relocator's region_labels
+ * table.  Just before writing each instruction we place its label at the current
+ * writer PC.  This allows arm64_relocator_write_one() to emit label-based
+ * branches (rather than absolute branches to the now-overwritten original code)
+ * for any PC-relative branch whose target lies inside [src, src+min_bytes). */
 size_t hook_relocate_instructions(void* src, void* dst, size_t min_bytes) {
     Arm64Writer w;
     Arm64Relocator r;
@@ -207,14 +214,38 @@ size_t hook_relocate_instructions(void* src, void* dst, size_t min_bytes) {
     arm64_writer_init(&w, dst, (uint64_t)dst, 256);
     arm64_relocator_init(&r, src, (uint64_t)src, &w);
 
+    /* Pre-create one label per source instruction in the hook region. */
+    int n = (int)(min_bytes / INSN_SIZE);
+    if (n > ARM64_RELOC_MAX_REGION) n = ARM64_RELOC_MAX_REGION;
+    r.region_end = (uint64_t)src + min_bytes;
+    r.region_label_count = n;
+    for (int i = 0; i < n; i++) {
+        r.region_labels[i].src_pc = (uint64_t)src + (uint64_t)(i * INSN_SIZE);
+        r.region_labels[i].label_id = arm64_writer_new_label_id(&w);
+    }
+
     size_t src_offset = 0;
+    int insn_idx = 0;
     while (src_offset < min_bytes) {
+        /* Place this instruction's label at the current write position BEFORE
+         * emitting the instruction so that backward references work immediately
+         * and forward references are resolved during flush. */
+        if (insn_idx < n)
+            arm64_writer_put_label(&w, r.region_labels[insn_idx].label_id);
+
         if (arm64_relocator_read_one(&r) == 0) break;
         arm64_relocator_write_one(&r);
         src_offset += INSN_SIZE;
+        insn_idx++;
     }
 
-    /* Flush any pending labels */
+    /* Place labels for any instructions that were not reached (e.g. early EOI)
+     * so that forward label references created before the loop exits are always
+     * resolved to a valid (if imprecise) position. */
+    for (int i = insn_idx; i < n; i++)
+        arm64_writer_put_label(&w, r.region_labels[i].label_id);
+
+    /* Flush pending label references (CBZ forward refs etc.) */
     arm64_writer_flush(&w);
 
     size_t written = arm64_writer_offset(&w);
@@ -430,14 +461,26 @@ static void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
         arm64_writer_put_blr_reg(&w, ARM64_REG_X16);
     }
 
-    /* Restore x0-x7 (arguments) - they may have been modified by callback */
-    for (int i = 0; i < 8; i += 2) {
+    /* Restore x0-x15 from the saved HookContext.
+     * x0-x7:  function arguments — the on_enter callback may have modified them.
+     * x8:     indirect result register (XR) — must be preserved for struct-return fns.
+     * x9-x15: caller-saved scratch — restore so the original function sees the same
+     *          values it would have received had there been no thunk in the way.
+     * x16:    NOT restored here — we keep it as scratch to load the trampoline address.
+     * x17-x18: restored after the trampoline load (see below). */
+    for (int i = 0; i < 16; i += 2) {
         arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X0 + i, ARM64_REG_X0 + i + 1,
                                                  ARM64_REG_SP, i * 8, ARM64_INDEX_SIGNED_OFFSET);
     }
 
-    /* Call original function via trampoline */
+    /* Call original function via trampoline.
+     * Load the trampoline address into x16 first (the only window where x16 is
+     * unavailable as general scratch), then restore x17-x18 from context, then
+     * execute BLR x16 so the original function runs with all registers intact. */
     arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)entry->trampoline);
+    /* Restore x17-x18 now that x16 holds the trampoline address */
+    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_X18,
+                                             ARM64_REG_SP, 136, ARM64_INDEX_SIGNED_OFFSET);
     arm64_writer_put_blr_reg(&w, ARM64_REG_X16);
 
     /* Save return value (x0) back to context */
