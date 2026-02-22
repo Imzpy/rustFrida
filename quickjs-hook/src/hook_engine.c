@@ -319,15 +319,16 @@ void* hook_install(void* target, void* replacement, int stealth) {
         return NULL;
     }
 
-    /* Tighten pool back to R-X before patching target */
-    pool_make_executable();
-
+    /* Install hook on target. Pool is still writable (RWX) here.
+     * entry->stealth (pool+0x50) and entry->next must be written before
+     * pool_make_executable() removes write permission. */
     if (stealth) {
         /* Stealth mode: write jump to a temp buffer, then patch via wxshadow */
         uint8_t jump_buf[MIN_HOOK_SIZE];
         jump_result = hook_write_jump(jump_buf, replacement);
         if (jump_result < 0) {
             free_entry(entry);
+            pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
             return NULL;
         }
@@ -337,6 +338,7 @@ void* hook_install(void* target, void* replacement, int stealth) {
         }
         if (wxshadow_patch(target, jump_buf, MIN_HOOK_SIZE) != 0) {
             free_entry(entry);
+            pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
             return NULL;
         }
@@ -346,12 +348,14 @@ void* hook_install(void* target, void* replacement, int stealth) {
         uintptr_t page_start = (uintptr_t)target & ~0xFFF;
         if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
             free_entry(entry);
+            pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
             return NULL;
         }
         jump_result = hook_write_jump(target, replacement);
         if (jump_result < 0) {
             free_entry(entry);
+            pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
             return NULL;
         }
@@ -362,9 +366,12 @@ void* hook_install(void* target, void* replacement, int stealth) {
     hook_flush_cache(target, MIN_HOOK_SIZE);
     hook_flush_cache(entry->trampoline, TRAMPOLINE_ALLOC_SIZE);
 
-    /* Add to list */
+    /* Add to list (entry->next is in pool, must be written while pool is still writable) */
     entry->next = g_engine.hooks;
     g_engine.hooks = entry;
+
+    /* Tighten pool to R-X now that all pool writes are done */
+    pool_make_executable();
 
     void* trampoline = entry->trampoline;
     pthread_mutex_unlock(&g_engine.lock);
@@ -548,15 +555,18 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         return HOOK_ERROR_ALLOC_FAILED;
     }
 
-    /* Tighten pool back to R-X before patching target */
-    pool_make_executable();
-
+    /* Install hook on target. Pool is still writable (RWX) here.
+     * entry->stealth (pool+0x50) and entry->next (pool+0x70) are in the pool
+     * and MUST be written before pool_make_executable() removes write permission.
+     * Moving pool_make_executable() to after all pool writes fixes the SIGSEGV
+     * that occurred when entry->stealth was written to a R-X pool. */
     if (stealth) {
         /* Stealth mode: write jump to temp buffer, patch via wxshadow */
         uint8_t jump_buf[MIN_HOOK_SIZE];
         jump_result = hook_write_jump(jump_buf, thunk_mem);
         if (jump_result < 0) {
             free_entry(entry);
+            pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
             return jump_result;
         }
@@ -565,6 +575,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         }
         if (wxshadow_patch(target, jump_buf, MIN_HOOK_SIZE) != 0) {
             free_entry(entry);
+            pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
             return HOOK_ERROR_WXSHADOW_FAILED;
         }
@@ -574,12 +585,14 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         uintptr_t page_start = (uintptr_t)target & ~0xFFF;
         if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
             free_entry(entry);
+            pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
             return HOOK_ERROR_MPROTECT_FAILED;
         }
         jump_result = hook_write_jump(target, thunk_mem);
         if (jump_result < 0) {
             free_entry(entry);
+            pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
             return jump_result;
         }
@@ -591,9 +604,12 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     hook_flush_cache(entry->trampoline, TRAMPOLINE_ALLOC_SIZE);
     hook_flush_cache(thunk_mem, thunk_size);
 
-    /* Add to list */
+    /* Add to list (entry->next is in pool, must be written while pool is still writable) */
     entry->next = g_engine.hooks;
     g_engine.hooks = entry;
+
+    /* Tighten pool to R-X now that all pool writes (stealth, next) are done */
+    pool_make_executable();
 
     pthread_mutex_unlock(&g_engine.lock);
     return HOOK_OK;
