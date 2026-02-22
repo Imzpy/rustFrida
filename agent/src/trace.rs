@@ -2,15 +2,13 @@
 
 use crate::gumlibc::{gum_libc_ptrace, gum_libc_waitpid};
 use crate::relocater;
-use crate::{ExecMem, GLOBAL_STREAM};
+use crate::{write_stream, ExecMem};
 use libc::{
     c_int, c_void, iovec, mmap, pid_t, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE,
     PROT_READ, PROT_WRITE, PTRACE_ATTACH, PTRACE_DETACH,
 };
 use std::sync::atomic::{AtomicPtr, Ordering};
 use nix::errno::Errno;
-use once_cell::unsync::Lazy;
-use std::io::Write;
 use std::mem::size_of;
 use std::ptr::null_mut;
 use std::sync::Mutex;
@@ -72,7 +70,9 @@ pub struct BranchRegUsage {
 // ============== 静态变量 ==============
 
 static INSTRUCT_PTR: AtomicPtr<u32> = AtomicPtr::new(core::ptr::null_mut());
-static mut EXE_MEM: Lazy<Mutex<ExecMem>> = Lazy::new(|| Mutex::new(ExecMem::new().unwrap()));
+// SAFETY: ExecMem: Send (see lib.rs). All access through Mutex so no data race.
+static EXE_MEM: once_cell::sync::Lazy<Mutex<ExecMem>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(ExecMem::new().unwrap()));
 
 // ============== ptrace 操作 ==============
 
@@ -363,10 +363,7 @@ pub unsafe fn resolve_next_addr(instr_ptr: *const u32, regs: UserRegs) -> Option
     use core::ptr;
 
     let instr = ptr::read_volatile(instr_ptr).swap_bytes();
-    let _ = GLOBAL_STREAM
-        .get()
-        .unwrap()
-        .write_all(format!("instruct: {:x}", instr).as_bytes());
+    write_stream(format!("instruct: {:x}", instr).as_bytes());
 
     let pc = (instr_ptr as usize).wrapping_add(4);
 
@@ -531,9 +528,7 @@ pub fn transformer_global(addr: usize) -> Result<usize> {
         match closure_result {
             Ok(_) => {}
             Err(e) => {
-                if let Some(mut stream) = GLOBAL_STREAM.get() {
-                    let _ = stream.write_all(e.as_bytes());
-                }
+                write_stream(e.as_bytes());
                 exe_mem.reset();
                 return Err(e);
             }
@@ -586,19 +581,11 @@ pub fn gum_modify_thread(thread_id: usize) -> Result<pid_t> {
 }
 
 extern "C" fn tracer(thread_id: i32) -> c_int {
-    let mut stream = GLOBAL_STREAM.get().unwrap();
-
     unsafe {
         match attach_to_thread(thread_id) {
-            Ok(_) => {
-                stream
-                    .write_all("attach success!! ".as_bytes())
-                    .expect("stream write error");
-            }
+            Ok(_) => write_stream(b"attach success!! "),
             Err(e) => {
-                stream
-                    .write_all(("tracer exit: ".to_string() + &e).as_bytes())
-                    .expect("stream write error");
+                write_stream(("tracer exit: ".to_string() + &e).as_bytes());
                 return -1;
             }
         }
@@ -606,10 +593,12 @@ extern "C" fn tracer(thread_id: i32) -> c_int {
 
         let mut regs = get_registers(thread_id).unwrap();
         INSTRUCT_PTR.store(regs.pc as *mut u32, Ordering::Release);
-        let _ = stream.write_all(
-            ("\nget pc: ".to_string()
-                + &(INSTRUCT_PTR.load(Ordering::Acquire) as usize).to_string())
-                .as_bytes(),
+        write_stream(
+            format!(
+                "\nget pc: {}",
+                INSTRUCT_PTR.load(Ordering::Acquire) as usize
+            )
+            .as_bytes(),
         );
 
         while !is_arm64_branch(*INSTRUCT_PTR.load(Ordering::Acquire)) {
@@ -621,14 +610,14 @@ extern "C" fn tracer(thread_id: i32) -> c_int {
         for instruct in gen_jump_to_transformer() {
             exe_mem.write_u32(instruct).unwrap();
         }
-        let _ = stream.write_all(
-            ("\ntrace compile finished :".to_string() + &(regs.pc as u64).to_string()).as_bytes(),
+        write_stream(
+            format!("\ntrace compile finished :{}", regs.pc as u64).as_bytes(),
         );
         regs.pc = exe_mem.ptr as usize;
         set_reg(thread_id, &mut regs).unwrap();
 
         gum_libc_ptrace(PTRACE_DETACH, thread_id, 0, 0);
-        let _ = stream.write_all("\ndone! detached!".as_bytes());
+        write_stream(b"\ndone! detached!");
         1
     }
 }

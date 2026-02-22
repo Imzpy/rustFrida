@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
-use crate::GLOBAL_STREAM;
-use std::io::Write;
+use crate::write_stream;
 
 /// 最终结果：是否真的改写了立即数；若超范围则原样写回并提示。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,10 +15,7 @@ pub enum RelocStatus {
 /// ⚠️ 需保证这两个地址可读/可写且 4 字节对齐。
 pub unsafe fn relocate_one_a64(src_addr: usize, dst_addr: usize) -> RelocStatus {
     let insn: u32 = core::ptr::read_volatile(src_addr as *const u32).swap_bytes();
-    GLOBAL_STREAM
-        .get()
-        .unwrap()
-        .write_all(format!("relocate_one_a64: {:x}\n", insn).as_bytes());
+    write_stream(format!("relocate_one_a64: {:x}\n", insn).as_bytes());
     match relocate_pc_relative(src_addr, dst_addr, insn) {
         TryPatch::Patched(p) => {
             core::ptr::write_volatile(dst_addr as *mut u32, p.swap_bytes());

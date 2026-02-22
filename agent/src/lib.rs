@@ -181,6 +181,11 @@ impl Drop for ExecMem {
     }
 }
 
+// SAFETY: ExecMem wraps a raw pointer to a private mmap'd region. The region
+// lives as long as ExecMem is alive (Drop unmaps it). All concurrent access is
+// serialized through the Mutex<ExecMem> in EXE_MEM, making cross-thread use sound.
+unsafe impl Send for ExecMem {}
+
 fn connect_socket() -> Result<UnixStream> {
     // 优先使用 hello_entry() 从 StringTable 读取的动态 socket 名（rust_frida_{pid}），
     // 回退到旧的硬编码值（仅用于兼容老版本 host）
@@ -222,7 +227,16 @@ fn connect_socket() -> Result<UnixStream> {
 /// agent 主循环退出标志，由 shutdown 命令设置
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 
-static GLOBAL_STREAM: OnceLock<UnixStream> = OnceLock::new();
+/// Write-half of the agent↔host socket, protected by Mutex to serialize messages
+/// from multiple threads (hook callbacks, tracer, command handlers).
+static GLOBAL_STREAM: OnceLock<Mutex<UnixStream>> = OnceLock::new();
+
+/// Write `data` to the global socket stream, serialized via Mutex.
+pub(crate) fn write_stream(data: &[u8]) {
+    if let Some(m) = GLOBAL_STREAM.get() {
+        let _ = m.lock().unwrap_or_else(|e| e.into_inner()).write_all(data);
+    }
+}
 /// 动态 socket 名，由 hello_entry() 从 StringTable 读取后保存
 static SOCKET_NAME: OnceLock<String> = OnceLock::new();
 static CACHE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -507,9 +521,7 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, _ucontext: 
         crash_msg.push_str("=== END BACKTRACE ===\n\n");
 
         // 尝试通过 socket 发送
-        if let Some(mut stream) = GLOBAL_STREAM.get() {
-            let _ = stream.write_all(crash_msg.as_bytes());
-        }
+        write_stream(crash_msg.as_bytes());
 
         // 重新抛出信号以便系统处理
         libc::signal(sig, libc::SIG_DFL);
@@ -585,25 +597,22 @@ fn install_panic_hook() {
 /// 日志函数：socket未连接时缓存，已连接时直接发送
 /// 不添加 [agent] 前缀（host 侧 log_agent! 宏已添加）
 fn log_msg(msg: String) {
-    match GLOBAL_STREAM.get() {
-        Some(mut stream) => {
-            let _ = stream.write_all(msg.as_bytes());
-        }
-        None => {
-            // Socket未连接，缓存日志
-            if let Ok(mut cache) = CACHE_LOG.lock() {
-                cache.push(msg);
-            }
+    if GLOBAL_STREAM.get().is_some() {
+        write_stream(msg.as_bytes());
+    } else {
+        // Socket未连接，缓存日志
+        if let Ok(mut cache) = CACHE_LOG.lock() {
+            cache.push(msg);
         }
     }
 }
 
 /// 刷新缓存的日志，在socket连接后调用
 fn flush_cached_logs() {
-    if let Some(mut stream) = GLOBAL_STREAM.get() {
+    if GLOBAL_STREAM.get().is_some() {
         if let Ok(mut cache) = CACHE_LOG.lock() {
             for msg in cache.drain(..) {
-                let _ = stream.write_all(msg.as_bytes());
+                write_stream(msg.as_bytes());
             }
         }
     }
@@ -648,17 +657,17 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
     }
 
-    // GLOBAL_STREAM.lock().unwrap().set(connect_socket().unwrap()).unwrap();
-    GLOBAL_STREAM
-        .set(connect_socket().expect("wwb connect socket failed!!!"))
-        .unwrap();
-    let mut stream = GLOBAL_STREAM.get().unwrap();
-    let _ = stream.write("HELLO_AGENT\n".as_bytes()).unwrap();
+    // Connect and split into read/write halves so BufReader and Mutex-guarded writes
+    // can operate concurrently on the same full-duplex Unix socket.
+    let sock = connect_socket().expect("wwb connect socket failed!!!");
+    let write_half = sock.try_clone().expect("stream clone failed");
+    GLOBAL_STREAM.set(Mutex::new(write_half)).unwrap();
+    write_stream(b"HELLO_AGENT\n");
     std::thread::sleep(Duration::from_millis(100));
     flush_cached_logs();
 
     // 循环等待命令：BufReader + read_line 确保任意长度命令完整接收（无截断）
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(sock);
     let mut line = String::new();
     loop {
         line.clear();
@@ -678,9 +687,7 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
             }
             Err(e) => {
                 // 读取错误
-                if let Some(mut s) = GLOBAL_STREAM.get() {
-                    let _ = s.write_all(format!("读取命令错误: {}\n", e).as_bytes());
-                }
+                write_stream(format!("读取命令错误: {}\n", e).as_bytes());
                 break;
             }
         }
@@ -706,14 +713,10 @@ fn process_cmd(command: &str) {
             std::thread::spawn(move || {
                 match trace::gum_modify_thread(tid) {
                     Ok(pid) => {
-                        if let Some(mut s) = GLOBAL_STREAM.get() {
-                            let _ = s.write_all(format!("clone success {}", pid).as_bytes());
-                        }
+                        write_stream(format!("clone success {}", pid).as_bytes());
                     }
                     Err(e) => {
-                        if let Some(mut s) = GLOBAL_STREAM.get() {
-                            let _ = s.write_all(format!("error: {}", e).as_bytes());
-                        }
+                        write_stream(format!("error: {}", e).as_bytes());
                     }
                 }
                 unsafe { kill(process::id() as pid_t, SIGSTOP) }
@@ -723,9 +726,7 @@ fn process_cmd(command: &str) {
             std::thread::spawn(|| match jhook() {
                 Ok(_) => {}
                 Err(e) => {
-                    if let Some(mut s) = GLOBAL_STREAM.get() {
-                        let _ = s.write_all(format!("{}", e).as_bytes());
-                    }
+                    write_stream(format!("{}", e).as_bytes());
                 }
             });
         }
@@ -788,29 +789,17 @@ fn process_cmd(command: &str) {
         Some("jsinit") => {
             // Fix #2: 通过 EVAL:/EVAL_ERR: 协议应答，host 可用 eval_state 同步等待
             match quickjs_loader::init() {
-                Ok(_) => {
-                    if let Some(mut stream) = GLOBAL_STREAM.get() {
-                        let _ = stream.write_all(b"EVAL:initialized\n");
-                    }
-                }
-                Err(e) => {
-                    if let Some(mut stream) = GLOBAL_STREAM.get() {
-                        let _ = stream.write_all(format!("EVAL_ERR:{}\n", e).as_bytes());
-                    }
-                }
+                Ok(_) => write_stream(b"EVAL:initialized\n"),
+                Err(e) => write_stream(format!("EVAL_ERR:{}\n", e).as_bytes()),
             }
         }
         #[cfg(feature = "quickjs")]
         Some("jsclean") => {
             if !quickjs_loader::is_initialized() {
-                if let Some(mut stream) = GLOBAL_STREAM.get() {
-                    let _ = stream.write_all("EVAL_ERR:[quickjs] JS 引擎未初始化\n".as_bytes());
-                }
+                write_stream("EVAL_ERR:[quickjs] JS 引擎未初始化\n".as_bytes());
             } else {
                 quickjs_loader::cleanup();
-                if let Some(mut stream) = GLOBAL_STREAM.get() {
-                    let _ = stream.write_all(b"EVAL:cleaned up\n");
-                }
+                write_stream(b"EVAL:cleaned up\n");
             }
         }
         #[cfg(feature = "quickjs")]
@@ -822,28 +811,16 @@ fn process_cmd(command: &str) {
                 .trim()
                 .to_string();
             if script.is_empty() {
-                if let Some(mut stream) = GLOBAL_STREAM.get() {
-                    let _ = stream.write_all(b"EVAL_ERR:[quickjs] Error: empty script\n");
-                }
+                write_stream(b"EVAL_ERR:[quickjs] Error: empty script\n");
             } else if !quickjs_loader::is_initialized() {
-                if let Some(mut stream) = GLOBAL_STREAM.get() {
-                    let _ = stream.write_all(
-                        "EVAL_ERR:[quickjs] JS 引擎未初始化，请先执行 jsinit\n".as_bytes(),
-                    );
-                }
+                write_stream("EVAL_ERR:[quickjs] JS 引擎未初始化，请先执行 jsinit\n".as_bytes());
             } else {
                 match quickjs_loader::execute_script(&script) {
-                    Ok(result) => {
-                        if let Some(mut stream) = GLOBAL_STREAM.get() {
-                            let _ = stream.write_all(format!("EVAL:{}\n", result).as_bytes());
-                        }
-                    }
+                    Ok(result) => write_stream(format!("EVAL:{}\n", result).as_bytes()),
                     Err(e) => {
                         // 用 \r 替换 \n，避免多行错误（含堆栈）被 \n 协议分割
                         let e = e.replace('\n', "\r");
-                        if let Some(mut stream) = GLOBAL_STREAM.get() {
-                            let _ = stream.write_all(format!("EVAL_ERR:{}\n", e).as_bytes());
-                        }
+                        write_stream(format!("EVAL_ERR:{}\n", e).as_bytes());
                     }
                 }
             }
@@ -856,29 +833,16 @@ fn process_cmd(command: &str) {
                 .trim()
                 .to_string();
             if expr.is_empty() {
-                if let Some(mut stream) = GLOBAL_STREAM.get() {
-                    let _ = stream
-                        .write_all("EVAL_ERR:[quickjs] 用法: jseval <expression>\n".as_bytes());
-                }
+                write_stream("EVAL_ERR:[quickjs] 用法: jseval <expression>\n".as_bytes());
             } else if !quickjs_loader::is_initialized() {
-                if let Some(mut stream) = GLOBAL_STREAM.get() {
-                    let _ = stream.write_all(
-                        "EVAL_ERR:[quickjs] JS 引擎未初始化，请先执行 jsinit\n".as_bytes(),
-                    );
-                }
+                write_stream("EVAL_ERR:[quickjs] JS 引擎未初始化，请先执行 jsinit\n".as_bytes());
             } else {
                 match quickjs_loader::execute_script(&expr) {
-                    Ok(result) => {
-                        if let Some(mut stream) = GLOBAL_STREAM.get() {
-                            let _ = stream.write_all(format!("EVAL:{}\n", result).as_bytes());
-                        }
-                    }
+                    Ok(result) => write_stream(format!("EVAL:{}\n", result).as_bytes()),
                     Err(e) => {
                         // 用 \r 替换 \n，避免多行错误（含堆栈）被 \n 协议分割
                         let e = e.replace('\n', "\r");
-                        if let Some(mut stream) = GLOBAL_STREAM.get() {
-                            let _ = stream.write_all(format!("EVAL_ERR:{}\n", e).as_bytes());
-                        }
+                        write_stream(format!("EVAL_ERR:{}\n", e).as_bytes());
                     }
                 }
             }
@@ -888,9 +852,7 @@ fn process_cmd(command: &str) {
             let prefix = command.strip_prefix("jscomplete").unwrap_or("").trim();
             let result = quickjs_loader::complete(prefix);
             // 直接写 socket，不走 log_msg（避免 [agent] 前缀干扰 host 解析）
-            if let Some(mut stream) = GLOBAL_STREAM.get() {
-                let _ = stream.write_all(format!("COMPLETE:{}\n", result).as_bytes());
-            }
+            write_stream(format!("COMPLETE:{}\n", result).as_bytes());
         }
         // Fix #4: shutdown — 清理资源并退出 agent 主循环
         Some("shutdown") => {

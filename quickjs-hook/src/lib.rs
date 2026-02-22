@@ -39,8 +39,9 @@ pub use value::JSValue;
 
 use std::sync::Mutex;
 
-/// Global JS engine instance (protected by Mutex)
-static JS_ENGINE: Mutex<Option<JSEngine>> = Mutex::new(None);
+/// Global JS engine instance (protected by Mutex).
+/// pub(crate) so hook_callback_wrapper can serialize concurrent JS_Call invocations.
+pub(crate) static JS_ENGINE: Mutex<Option<JSEngine>> = Mutex::new(None);
 
 /// Initialize the hook engine with executable memory
 ///

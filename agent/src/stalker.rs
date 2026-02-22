@@ -1,7 +1,7 @@
 /* frida-gum stalker 功能模块 */
 #![cfg(feature = "frida-gum")]
 
-use crate::{log_msg, GLOBAL_STREAM, OUTPUT_PATH};
+use crate::{log_msg, write_stream, OUTPUT_PATH};
 use crossbeam_channel::{bounded, Sender};
 use frida_gum::interceptor::{Interceptor, InvocationContext, InvocationListener, ProbeListener};
 use frida_gum::stalker::{Event, EventMask, EventSink, Stalker, Transformer};
@@ -472,10 +472,7 @@ impl InvocationListener for OpenListener {
         log_msg(format!("oopps stalker {}", _context.thread_id()));
     }
     fn on_leave(&mut self, _context: InvocationContext) {
-        let _ = GLOBAL_STREAM
-            .get()
-            .unwrap()
-            .write_all("end trace".as_bytes());
+        write_stream(b"end trace");
         get_stalker().deactivate();
     }
 }

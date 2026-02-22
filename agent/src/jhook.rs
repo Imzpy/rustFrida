@@ -1,6 +1,6 @@
 use jni::sys::JNIEnv;
 // use sys::JavaVM;
-use crate::GLOBAL_STREAM;
+use crate::write_stream;
 use jni::sys;
 use jni::JavaVM;
 use libc::{c_char, dlopen, dlsym, malloc, memset, size_t, RTLD_NOW};
@@ -8,7 +8,6 @@ use std::alloc::{alloc, Layout};
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
 use std::hash::Hash;
-use std::io::Write;
 use std::os::unix::net::UnixStream;
 
 use std::sync::OnceLock;
@@ -84,16 +83,12 @@ static codename: OnceLock<String> = OnceLock::new();
 pub fn jhook() -> Result<String, String> {
     let lib_art = unsafe { dlopen(CString::new("libart.so").unwrap().as_ptr(), RTLD_NOW) };
     if lib_art.is_null() {
-        if let Some(mut stream) = GLOBAL_STREAM.get() {
-            let _ = stream.write_all(b"dlopen failed");
-        }
+        write_stream(b"dlopen failed");
         return Err(String::from("dlopen failed"));
     }
     let lib_c = unsafe { dlopen(CString::new("libc.so").unwrap().as_ptr(), RTLD_NOW) };
     if lib_c.is_null() {
-        if let Some(mut stream) = GLOBAL_STREAM.get() {
-            let _ = stream.write_all(b"dlopen failed");
-        }
+        write_stream(b"dlopen failed");
         return Err(String::from("dlopen failed"));
     }
 
@@ -199,9 +194,7 @@ pub fn jhook() -> Result<String, String> {
         }
 
         if !spec_found {
-            if let Some(mut stream) = GLOBAL_STREAM.get() {
-                let _ = stream.write_all(b"find offset failed");
-            }
+            write_stream(b"find offset failed");
             return Err(String::from("find offset failed"));
         }
     }

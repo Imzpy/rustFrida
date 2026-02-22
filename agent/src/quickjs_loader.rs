@@ -13,14 +13,13 @@ use quickjs_hook::{
     cleanup_engine, cleanup_hook_engine, cleanup_hooks, complete_script, get_or_init_engine,
     init_hook_engine, load_script, set_console_callback,
 };
-use std::io::Write;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-use crate::GLOBAL_STREAM;
+use crate::write_stream;
 
 /// Executable memory for hooks
 static EXEC_MEM: OnceLock<ExecMemory> = OnceLock::new();
@@ -97,9 +96,7 @@ pub fn init() -> Result<(), String> {
 
     // Set up console callback to send output to socket
     set_console_callback(|msg| {
-        if let Some(mut stream) = GLOBAL_STREAM.get() {
-            let _ = stream.write_all(format!("[JS] {}\n", msg).as_bytes());
-        }
+        write_stream(format!("[JS] {}\n", msg).as_bytes());
     });
 
     ENGINE_INITIALIZED.store(true, Ordering::SeqCst);

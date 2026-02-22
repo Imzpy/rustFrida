@@ -54,7 +54,7 @@ static HOOK_REGISTRY: Mutex<Option<HashMap<u64, HookData>>> = Mutex::new(None);
 
 /// Initialize hook registry
 fn init_registry() {
-    let mut guard = HOOK_REGISTRY.lock().unwrap();
+    let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Some(HashMap::new());
     }
@@ -110,6 +110,13 @@ unsafe extern "C" fn hook_callback_wrapper(
         };
         (hook_data.ctx, hook_data.callback_bytes)
     }; // HOOK_REGISTRY lock released here
+
+    // Serialize concurrent JS_Call invocations from multiple hooked threads.
+    // QuickJS is not thread-safe; without this lock, two threads hitting the same
+    // hook simultaneously would corrupt the runtime state.
+    // NOTE: If a hooked function is called from within a JS evaluation on the same
+    // thread (e.g. via callNative), this will deadlock. That usage is unsupported.
+    let _js_guard = crate::JS_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
 
     let ctx = ctx_usize as *mut ffi::JSContext;
     // Reconstruct JSValue from bytes
@@ -273,7 +280,7 @@ unsafe extern "C" fn js_hook(
     );
 
     {
-        let mut guard = HOOK_REGISTRY.lock().unwrap();
+        let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let registry = guard.as_mut().unwrap();
         registry.insert(
             addr,
@@ -295,7 +302,7 @@ unsafe extern "C" fn js_hook(
 
     if result != HOOK_OK {
         // Failed - cleanup
-        let mut guard = HOOK_REGISTRY.lock().unwrap();
+        let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(registry) = guard.as_mut() {
             if let Some(data) = registry.remove(&addr) {
                 let callback: ffi::JSValue =
@@ -339,7 +346,7 @@ unsafe extern "C" fn js_unhook(
 
     // Remove from registry and free callback
     {
-        let mut guard = HOOK_REGISTRY.lock().unwrap();
+        let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(registry) = guard.as_mut() {
             if let Some(data) = registry.remove(&addr) {
                 let ctx = data.ctx as *mut ffi::JSContext;
@@ -464,7 +471,7 @@ pub fn register_hook_api(ctx: &JSContext) {
 
 /// Cleanup all hooks (call before dropping context)
 pub fn cleanup_hooks() {
-    let mut guard = HOOK_REGISTRY.lock().unwrap();
+    let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(registry) = guard.take() {
         for (addr, data) in registry {
             unsafe {
