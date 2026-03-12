@@ -101,6 +101,10 @@ pub(super) type NewGlobalRefFn =
 pub(super) type DeleteGlobalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void);
 pub(super) type GetObjectClassFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+pub(super) type GetSuperclassFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+pub(super) type IsSameObjectFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u8;
 pub(super) type NewObjectAFn = unsafe extern "C" fn(
     JniEnv,
     *mut std::ffi::c_void,
@@ -633,6 +637,7 @@ fn probe_with_known_method_legacy(env: JniEnv) -> Option<usize> {
 // ============================================================================
 
 pub(super) const JNI_FIND_CLASS: usize = 6;
+pub(super) const JNI_GET_SUPERCLASS: usize = 10;
 pub(super) const JNI_TO_REFLECTED_METHOD: usize = 9;
 #[allow(dead_code)]
 pub(super) const JNI_TO_REFLECTED_FIELD: usize = 12;
@@ -640,6 +645,7 @@ pub(super) const JNI_EXCEPTION_CLEAR: usize = 17;
 pub(super) const JNI_PUSH_LOCAL_FRAME: usize = 19;
 pub(super) const JNI_POP_LOCAL_FRAME: usize = 20;
 pub(super) const JNI_DELETE_LOCAL_REF: usize = 23;
+pub(super) const JNI_IS_SAME_OBJECT: usize = 24;
 pub(super) const JNI_GET_METHOD_ID: usize = 33;
 pub(super) const JNI_CALL_OBJECT_METHOD_A: usize = 36;
 pub(super) const JNI_CALL_BOOLEAN_METHOD_A: usize = 39;

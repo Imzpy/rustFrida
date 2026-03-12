@@ -121,6 +121,15 @@
         return envPtr;
     }
 
+    function _getRefPtr(value) {
+        if (value !== null
+            && typeof value === "object"
+            && Object.prototype.hasOwnProperty.call(value, "__jptr")) {
+            value = value.__jptr;
+        }
+        return _toPtr(value);
+    }
+
     function _resolveEnvAndName(envOrName, maybeName) {
         if (arguments.length === 1) {
             return {
@@ -132,6 +141,20 @@
         return {
             env: _getEnvPtr(envOrName),
             name: maybeName
+        };
+    }
+
+    function _resolveEnvAndRef(envOrRef, maybeRef) {
+        if (arguments.length === 1) {
+            return {
+                env: _getCurrentThreadEnv(),
+                ref: _getRefPtr(envOrRef)
+            };
+        }
+
+        return {
+            env: _getEnvPtr(envOrRef),
+            ref: _getRefPtr(maybeRef)
         };
     }
 
@@ -393,17 +416,25 @@
             get ptr() {
                 return _getCurrentThreadEnv();
             },
-            getObjectClass: function(obj) {
-                return _toPtr(_callJni("GetObjectClass", obj));
+            getObjectClass: function(envOrObj, maybeObj) {
+                var resolved = _resolveEnvAndRef.apply(null, arguments);
+                return _toPtr(_api._getObjectClass(resolved.env, resolved.ref));
             },
-            getSuperclass: function(clazz) {
-                return _toPtr(_callJni("GetSuperclass", clazz));
+            getSuperclass: function(envOrClazz, maybeClazz) {
+                var resolved = _resolveEnvAndRef.apply(null, arguments);
+                return _toPtr(_api._getSuperclass(resolved.env, resolved.ref));
             },
-            isSameObject: function(a, b) {
-                return Number(_callJni("IsSameObject", a, b)) !== 0;
+            isSameObject: function(envOrA, aOrB, maybeB) {
+                var env = arguments.length >= 3 ? _getEnvPtr(envOrA) : _getCurrentThreadEnv();
+                var a = arguments.length >= 3 ? _getRefPtr(aOrB) : _getRefPtr(envOrA);
+                var b = arguments.length >= 3 ? _getRefPtr(maybeB) : _getRefPtr(aOrB);
+                return !!_api._isSameObject(env, a, b);
             },
-            isInstanceOf: function(obj, clazz) {
-                return Number(_callJni("IsInstanceOf", obj, clazz)) !== 0;
+            isInstanceOf: function(envOrObj, objOrClazz, maybeClazz) {
+                var env = arguments.length >= 3 ? _getEnvPtr(envOrObj) : _getCurrentThreadEnv();
+                var obj = arguments.length >= 3 ? _getRefPtr(objOrClazz) : _getRefPtr(envOrObj);
+                var clazz = arguments.length >= 3 ? _getRefPtr(maybeClazz) : _getRefPtr(objOrClazz);
+                return !!_api._isInstanceOf(env, obj, clazz);
             },
             exceptionCheck: function() {
                 return Number(_callJni("ExceptionCheck")) !== 0;
@@ -415,41 +446,30 @@
                 _callJni("ExceptionClear");
                 return true;
             },
-            readJString: function(jstr) {
-                var strPtr = _toPtr(jstr);
+            readJString: function(envOrJstr, maybeJstr) {
+                var resolved = _resolveEnvAndRef.apply(null, arguments);
+                var env = resolved.env;
+                var strPtr = resolved.ref;
                 if (strPtr.toString() === "0x0") {
                     return null;
                 }
-
-                var utfChars = _toPtr(_callJni("GetStringUTFChars", strPtr, 0));
-                if (utfChars.toString() === "0x0") {
-                    return null;
-                }
-
-                try {
-                    return _readCStringMaybe(utfChars);
-                } finally {
-                    _callJni("ReleaseStringUTFChars", strPtr, utfChars);
-                }
+                return _api._readJString(env, strPtr);
             },
-            getClassName: function(clazz) {
-                var cls = _toPtr(clazz);
+            getClassName: function(envOrClazz, maybeClazz) {
+                var resolved = _resolveEnvAndRef.apply(null, arguments);
+                var cls = resolved.ref;
                 if (cls.toString() === "0x0") {
                     return null;
                 }
-                return _className(_getCurrentThreadEnv(), cls);
+                return _className(resolved.env, cls);
             },
-            getObjectClassName: function(obj) {
-                var cls = _toPtr(_callJni("GetObjectClass", obj));
-                if (cls.toString() === "0x0") {
+            getObjectClassName: function(envOrObj, maybeObj) {
+                var resolved = _resolveEnvAndRef.apply(null, arguments);
+                var obj = resolved.ref;
+                if (obj.toString() === "0x0") {
                     return null;
                 }
-
-                try {
-                    return _className(_getCurrentThreadEnv(), cls);
-                } finally {
-                    _callJni("DeleteLocalRef", cls);
-                }
+                return _api._getObjectClassName(resolved.env, obj);
             }
         };
     }

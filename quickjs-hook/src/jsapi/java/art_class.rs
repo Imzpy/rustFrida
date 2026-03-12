@@ -499,6 +499,36 @@ where
 // jclass 解码
 // ============================================================================
 
+unsafe fn decode_jobject(env: JniEnv, obj: *mut std::ffi::c_void) -> Option<u64> {
+    const DECODE_JOBJECT_SYMBOLS: [&str; 2] = [
+        "_ZNK3art6Thread13DecodeJObjectEP8_jobject",
+        "_ZN3art6Thread13DecodeJObjectEP8_jobject",
+    ];
+
+    let thread = get_thread_ptr(env);
+    if thread == 0 {
+        return None;
+    }
+
+    type DecodeJObjectFn = unsafe extern "C" fn(thread: u64, obj: *mut std::ffi::c_void) -> u64;
+
+    for sym_name in DECODE_JOBJECT_SYMBOLS {
+        let decode_sym = libart_dlsym(sym_name);
+        if decode_sym.is_null() {
+            continue;
+        }
+
+        let decode: DecodeJObjectFn = std::mem::transmute(decode_sym);
+        let result = decode(thread, obj);
+        let stripped = result & PAC_STRIP_MASK;
+        if stripped != 0 {
+            return Some(stripped);
+        }
+    }
+
+    None
+}
+
 /// 解码 jclass 引用为 mirror::Class* 地址
 ///
 /// 策略 1: dlsym Thread::DecodeJObject — 最可靠，支持所有 ref 类型
@@ -507,24 +537,12 @@ where
 /// 注意: 调用方应在 kRunnable 状态下调用此函数（通过 with_runnable_thread 包裹），
 /// 以确保 CC GC 不会在解码后移动对象。
 unsafe fn decode_jclass(env: JniEnv, cls: *mut std::ffi::c_void) -> Option<u64> {
-    // 策略 1: Thread::DecodeJObject(jobject) → mirror::Object*
-    let decode_sym = libart_dlsym("_ZN3art6Thread13DecodeJObjectEP8_jobject");
-    if !decode_sym.is_null() {
-        let thread = get_thread_ptr(env);
-        if thread != 0 {
-            type DecodeJObjectFn =
-                unsafe extern "C" fn(thread: u64, obj: *mut std::ffi::c_void) -> u64;
-            let decode: DecodeJObjectFn = std::mem::transmute(decode_sym);
-            let result = decode(thread, cls);
-            let stripped = result & PAC_STRIP_MASK;
-            if stripped != 0 {
-                output_message(&format!(
-                    "[art class] DecodeJObject: ref={:#x} → mirror::Class*={:#x}",
-                    cls as u64, stripped
-                ));
-                return Some(stripped);
-            }
-        }
+    if let Some(stripped) = decode_jobject(env, cls) {
+        output_message(&format!(
+            "[art class] DecodeJObject: ref={:#x} → mirror::Class*={:#x}",
+            cls as u64, stripped
+        ));
+        return Some(stripped);
     }
 
     // 策略 2: 直接读取 global ref entry
@@ -568,7 +586,6 @@ pub(super) unsafe fn is_valid_jni_ref(env: JniEnv, obj: *mut std::ffi::c_void) -
     }
 
     with_runnable_thread(env, || {
-        refresh_mem_regions();
-        decode_jclass(env, obj).is_some()
+        decode_jobject(env, obj).is_some()
     })
 }

@@ -65,6 +65,140 @@ use java_method_list_api::*;
 use jni_core::*;
 use reflect::*;
 
+#[inline]
+unsafe fn validate_jni_ref(env: JniEnv, obj: *mut std::ffi::c_void) -> bool {
+    !obj.is_null() && art_class::is_valid_jni_ref(env, obj)
+}
+
+pub(crate) unsafe fn try_read_jstring(env_ptr: u64, obj_ptr: u64) -> Option<String> {
+    let env = env_ptr as JniEnv;
+    let obj = obj_ptr as *mut std::ffi::c_void;
+    if env.is_null() || obj.is_null() {
+        return None;
+    }
+
+    if !validate_jni_ref(env, obj) {
+        return None;
+    }
+
+    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    let is_instance_of: IsInstanceOfFn = jni_fn!(env, IsInstanceOfFn, JNI_IS_INSTANCE_OF);
+    let get_str: GetStringUtfCharsFn =
+        jni_fn!(env, GetStringUtfCharsFn, JNI_GET_STRING_UTF_CHARS);
+    let rel_str: ReleaseStringUtfCharsFn =
+        jni_fn!(env, ReleaseStringUtfCharsFn, JNI_RELEASE_STRING_UTF_CHARS);
+
+    let local_obj = new_local_ref(env, obj);
+    if local_obj.is_null() || jni_check_exc(env) {
+        return None;
+    }
+
+    let mut chars: *const std::os::raw::c_char = std::ptr::null();
+    let result = (|| {
+        if let Some(reflect) = REFLECT_IDS.get() {
+            if !reflect.string_class.is_null()
+                && (is_instance_of(env, local_obj, reflect.string_class) == 0 || jni_check_exc(env))
+            {
+                return None;
+            }
+        }
+
+        chars = get_str(env, local_obj, std::ptr::null_mut());
+        if chars.is_null() {
+            jni_check_exc(env);
+            return None;
+        }
+
+        Some(std::ffi::CStr::from_ptr(chars).to_string_lossy().into_owned())
+    })();
+
+    if !chars.is_null() {
+        rel_str(env, local_obj, chars);
+    }
+    delete_local_ref(env, local_obj);
+    result
+}
+
+pub(crate) unsafe fn try_get_class_name(env_ptr: u64, cls_ptr: u64) -> Option<String> {
+    let env = env_ptr as JniEnv;
+    let cls = cls_ptr as *mut std::ffi::c_void;
+    if env.is_null() || !validate_jni_ref(env, cls) {
+        return None;
+    }
+
+    crate::jsapi::java::get_class_name_unchecked(env_ptr, cls_ptr)
+}
+
+pub(crate) unsafe fn try_get_object_class(env_ptr: u64, obj_ptr: u64) -> Option<u64> {
+    let env = env_ptr as JniEnv;
+    let obj = obj_ptr as *mut std::ffi::c_void;
+    if env.is_null() || !validate_jni_ref(env, obj) {
+        return None;
+    }
+
+    let get_object_class: GetObjectClassFn = jni_fn!(env, GetObjectClassFn, JNI_GET_OBJECT_CLASS);
+    let cls = get_object_class(env, obj);
+    if cls.is_null() || jni_check_exc(env) {
+        None
+    } else {
+        Some(cls as u64)
+    }
+}
+
+pub(crate) unsafe fn try_get_superclass(env_ptr: u64, cls_ptr: u64) -> Option<u64> {
+    let env = env_ptr as JniEnv;
+    let cls = cls_ptr as *mut std::ffi::c_void;
+    if env.is_null() || !validate_jni_ref(env, cls) {
+        return None;
+    }
+
+    let get_superclass: GetSuperclassFn = jni_fn!(env, GetSuperclassFn, JNI_GET_SUPERCLASS);
+    let super_cls = get_superclass(env, cls);
+    if super_cls.is_null() || jni_check_exc(env) {
+        None
+    } else {
+        Some(super_cls as u64)
+    }
+}
+
+pub(crate) unsafe fn try_is_same_object(env_ptr: u64, a_ptr: u64, b_ptr: u64) -> bool {
+    let env = env_ptr as JniEnv;
+    let a = a_ptr as *mut std::ffi::c_void;
+    let b = b_ptr as *mut std::ffi::c_void;
+    if env.is_null() {
+        return false;
+    }
+    if (!a.is_null() && !validate_jni_ref(env, a)) || (!b.is_null() && !validate_jni_ref(env, b)) {
+        return false;
+    }
+
+    let is_same_object: IsSameObjectFn = jni_fn!(env, IsSameObjectFn, JNI_IS_SAME_OBJECT);
+    is_same_object(env, a, b) != 0 && !jni_check_exc(env)
+}
+
+pub(crate) unsafe fn try_is_instance_of(env_ptr: u64, obj_ptr: u64, cls_ptr: u64) -> bool {
+    let env = env_ptr as JniEnv;
+    let obj = obj_ptr as *mut std::ffi::c_void;
+    let cls = cls_ptr as *mut std::ffi::c_void;
+    if env.is_null() || !validate_jni_ref(env, obj) || !validate_jni_ref(env, cls) {
+        return false;
+    }
+
+    let is_instance_of: IsInstanceOfFn = jni_fn!(env, IsInstanceOfFn, JNI_IS_INSTANCE_OF);
+    is_instance_of(env, obj, cls) != 0 && !jni_check_exc(env)
+}
+
+pub(crate) unsafe fn try_get_object_class_name(env_ptr: u64, obj_ptr: u64) -> Option<String> {
+    let env = env_ptr as JniEnv;
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    let cls = try_get_object_class(env_ptr, obj_ptr)? as *mut std::ffi::c_void;
+    let name = try_get_class_name(env_ptr, cls as u64);
+    delete_local_ref(env, cls);
+    name
+}
+
 /// JS CFunction: Java.deopt() — 清空 JIT 缓存 (InvalidateAllMethods)
 /// 返回 true/false 表示操作是否成功
 unsafe extern "C" fn js_java_deopt(
